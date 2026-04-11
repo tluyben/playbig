@@ -1,0 +1,928 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * playbig — CLI for the playbig browser session management API.
+ *
+ * Config (~/.playbig, key=value format, or bare token):
+ *   token=<access-token>
+ *   url=http://localhost:3000
+ *
+ * Env var overrides:
+ *   PLAYBIG_TOKEN=<token>
+ *   PLAYBIG_URL=http://localhost:3000
+ *
+ * Current session ID is stored in ~/.playbig-session.
+ */
+
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+
+const CONFIG_FILE  = path.join(os.homedir(), '.playbig');
+const SESSION_FILE = path.join(os.homedir(), '.playbig-session');
+
+// ── Config ───────────────────────────────────────────────────────────────────
+
+function loadConfig() {
+  let token   = process.env.PLAYBIG_TOKEN || '';
+  let baseUrl = process.env.PLAYBIG_URL   || 'http://localhost:3000';
+
+  if (fs.existsSync(CONFIG_FILE)) {
+    const raw = fs.readFileSync(CONFIG_FILE, 'utf8').trim();
+    if (raw.includes('=') || raw.includes('\n')) {
+      // key=value format
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eq  = trimmed.indexOf('=');
+        if (eq < 0) continue;
+        const key = trimmed.slice(0, eq).trim();
+        const val = trimmed.slice(eq + 1).trim();
+        if (key === 'token'  && !process.env.PLAYBIG_TOKEN) token   = val;
+        if (key === 'url'    && !process.env.PLAYBIG_URL)   baseUrl = val;
+      }
+    } else {
+      // bare token on a single line
+      if (!process.env.PLAYBIG_TOKEN) token = raw;
+    }
+  }
+
+  return { token, baseUrl: baseUrl.replace(/\/$/, '') };
+}
+
+// ── Session state ────────────────────────────────────────────────────────────
+
+function readSession() {
+  try {
+    const id = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSession(id) {
+  if (id) {
+    fs.writeFileSync(SESSION_FILE, id + '\n', 'utf8');
+  } else {
+    try { fs.unlinkSync(SESSION_FILE); } catch {}
+  }
+}
+
+// ── HTTP client ──────────────────────────────────────────────────────────────
+
+async function apiRequest(config, method, urlPath, body, query = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (config.token) headers['Authorization'] = `Bearer ${config.token}`;
+
+  const qs = Object.keys(query).length
+    ? '?' + new URLSearchParams(query).toString()
+    : '';
+
+  const fetchOpts = { method, headers };
+  if (body !== undefined) fetchOpts.body = JSON.stringify(body);
+
+  const fullUrl = `${config.baseUrl}${urlPath}${qs}`;
+  let res;
+  try {
+    res = await fetch(fullUrl, fetchOpts);
+  } catch (err) {
+    throw new Error(`Cannot connect to playbig at ${config.baseUrl}: ${err.message}`);
+  }
+
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+
+  if (!res.ok) {
+    const msg = (data && typeof data === 'object' && data.error) ? data.error : (text || res.statusText);
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data   = data;
+    throw err;
+  }
+
+  return data;
+}
+
+// ── Session resolution ────────────────────────────────────────────────────────
+
+// Returns the session ID to use: config.session (from --session flag) > ~/.playbig-session
+function resolveSession(config) {
+  const id = (config && config.session) || readSession();
+  if (!id) {
+    console.error('No active session. Run: playbig start-session [url]');
+    process.exit(1);
+  }
+  return id;
+}
+
+async function runAction(config, action, params = {}) {
+  const id = resolveSession(config);
+  return apiRequest(config, 'POST', `/sessions/${id}/action`, { action, params });
+}
+
+// ── Output ───────────────────────────────────────────────────────────────────
+
+function print(data) {
+  if (typeof data === 'string') {
+    process.stdout.write(data + '\n');
+  } else {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  }
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+const COMMANDS = {};
+
+// Session management
+COMMANDS['start-session'] = {
+  usage: 'start-session [url]',
+  desc:  'Create a new browser session (ends any existing session first)',
+  async run(config, args) {
+    const existing = readSession();
+    if (existing) {
+      try {
+        await apiRequest(config, 'DELETE', `/sessions/${existing}`);
+        console.error(`Ended previous session: ${existing}`);
+      } catch { /* ignore — session may already be gone */ }
+      writeSession(null);
+    }
+
+    const startUrl = args[0];
+    const body = startUrl ? { url: startUrl } : {};
+    const session = await apiRequest(config, 'POST', '/sessions', body);
+    writeSession(session.id);
+    console.log(`Session started: ${session.id}`);
+    if (session.startUrl) console.log(`URL: ${session.startUrl}`);
+    return session;
+  },
+};
+
+COMMANDS['end-session'] = {
+  usage: 'end-session [session-id]',
+  desc:  'End the current (or specified) session',
+  async run(config, args) {
+    const id = args[0] || resolveSession(config);
+    await apiRequest(config, 'DELETE', `/sessions/${id}`);
+    if (!args[0] || args[0] === readSession()) writeSession(null);
+    console.log(`Session ended: ${id}`);
+  },
+};
+
+COMMANDS['sessions'] = {
+  usage: 'sessions',
+  desc:  'List all active sessions (* marks the current one)',
+  async run(config) {
+    const data    = await apiRequest(config, 'GET', '/sessions');
+    const current = readSession();
+    if (!data.sessions.length) {
+      console.log('No active sessions.');
+    } else {
+      for (const s of data.sessions) {
+        const marker = s.id === current ? '*' : ' ';
+        const age = Math.round(s.ageMs / 1000);
+        console.log(`${marker} ${s.id}  status=${s.status}  age=${age}s  url=${s.startUrl || '(none)'}`);
+      }
+    }
+    return data;
+  },
+};
+
+COMMANDS['status'] = {
+  usage: 'status [session-id]',
+  desc:  'Show session metadata (defaults to current session)',
+  async run(config, args) {
+    const id   = args[0] || resolveSession(config);
+    const data = await apiRequest(config, 'GET', `/sessions/${id}`);
+    print(data);
+    return data;
+  },
+};
+
+COMMANDS['health'] = {
+  usage: 'health',
+  desc:  'Show service health and diagnostics',
+  async run(config) {
+    const data = await apiRequest(config, 'GET', '/health');
+    print(data);
+    return data;
+  },
+};
+
+// Navigation
+COMMANDS['goto'] = {
+  usage: 'goto <url>',
+  desc:  'Navigate to a URL',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig goto <url>');
+    const res = await runAction(config, 'navigate', { url: args[0] });
+    console.log(`Navigated to: ${res.result.url}`);
+    return res;
+  },
+};
+
+COMMANDS['reload'] = {
+  usage: 'reload',
+  desc:  'Reload the current page',
+  async run(config) {
+    const res = await runAction(config, 'reload');
+    console.log(`Reloaded: ${res.result.url}`);
+    return res;
+  },
+};
+
+COMMANDS['back'] = {
+  usage: 'back',
+  desc:  'Navigate back',
+  async run(config) {
+    const res = await runAction(config, 'back');
+    console.log(`Back to: ${res.result.url}`);
+    return res;
+  },
+};
+
+COMMANDS['forward'] = {
+  usage: 'forward',
+  desc:  'Navigate forward',
+  async run(config) {
+    const res = await runAction(config, 'forward');
+    console.log(`Forward to: ${res.result.url}`);
+    return res;
+  },
+};
+
+COMMANDS['url'] = {
+  usage: 'url',
+  desc:  'Print the current page URL',
+  async run(config) {
+    const res = await runAction(config, 'url');
+    console.log(res.result.url);
+    return res;
+  },
+};
+
+COMMANDS['title'] = {
+  usage: 'title',
+  desc:  'Print the current page title',
+  async run(config) {
+    const res = await runAction(config, 'title');
+    console.log(res.result.title);
+    return res;
+  },
+};
+
+COMMANDS['content'] = {
+  usage: 'content',
+  desc:  'Print the full page HTML',
+  async run(config) {
+    const res = await runAction(config, 'content');
+    console.log(res.result.html);
+    return res;
+  },
+};
+
+// DOM interaction
+COMMANDS['click'] = {
+  usage: 'click <selector>',
+  desc:  'Click an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig click <selector>');
+    await runAction(config, 'click', { selector: args[0] });
+    console.log(`Clicked: ${args[0]}`);
+  },
+};
+
+COMMANDS['dblclick'] = {
+  usage: 'dblclick <selector>',
+  desc:  'Double-click an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig dblclick <selector>');
+    await runAction(config, 'dblclick', { selector: args[0] });
+    console.log(`Double-clicked: ${args[0]}`);
+  },
+};
+
+COMMANDS['fill'] = {
+  usage: 'fill <selector> <value>',
+  desc:  'Clear and fill an input field',
+  async run(config, args) {
+    if (!args[0] || args[1] === undefined) throw new Error('Usage: playbig fill <selector> <value>');
+    await runAction(config, 'fill', { selector: args[0], value: args[1] });
+    console.log(`Filled: ${args[0]}`);
+  },
+};
+
+COMMANDS['type'] = {
+  usage: 'type <selector> <text>',
+  desc:  'Type text into an element character by character',
+  async run(config, args) {
+    if (!args[0] || args[1] === undefined) throw new Error('Usage: playbig type <selector> <text>');
+    await runAction(config, 'type', { selector: args[0], text: args[1] });
+    console.log(`Typed into: ${args[0]}`);
+  },
+};
+
+COMMANDS['press'] = {
+  usage: 'press <key>',
+  desc:  'Press a keyboard key (e.g. Enter, Tab, Escape, ArrowDown)',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig press <key>');
+    await runAction(config, 'pressKey', { key: args[0] });
+    console.log(`Pressed: ${args[0]}`);
+  },
+};
+
+COMMANDS['hover'] = {
+  usage: 'hover <selector>',
+  desc:  'Hover the mouse over an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig hover <selector>');
+    await runAction(config, 'hover', { selector: args[0] });
+    console.log(`Hovered: ${args[0]}`);
+  },
+};
+
+COMMANDS['select'] = {
+  usage: 'select <selector> <value>',
+  desc:  'Select a <select> dropdown option by value',
+  async run(config, args) {
+    if (!args[0] || args[1] === undefined) throw new Error('Usage: playbig select <selector> <value>');
+    const res = await runAction(config, 'select', { selector: args[0], value: args[1] });
+    console.log(`Selected: ${res.result.values.join(', ')}`);
+    return res;
+  },
+};
+
+COMMANDS['check'] = {
+  usage: 'check <selector>',
+  desc:  'Check a checkbox',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig check <selector>');
+    await runAction(config, 'check', { selector: args[0] });
+    console.log(`Checked: ${args[0]}`);
+  },
+};
+
+COMMANDS['uncheck'] = {
+  usage: 'uncheck <selector>',
+  desc:  'Uncheck a checkbox',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig uncheck <selector>');
+    await runAction(config, 'uncheck', { selector: args[0] });
+    console.log(`Unchecked: ${args[0]}`);
+  },
+};
+
+COMMANDS['focus'] = {
+  usage: 'focus <selector>',
+  desc:  'Focus an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig focus <selector>');
+    await runAction(config, 'focus', { selector: args[0] });
+    console.log(`Focused: ${args[0]}`);
+  },
+};
+
+// Element queries
+COMMANDS['innertext'] = {
+  usage: 'innertext <selector>',
+  desc:  'Print inner text of an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig innertext <selector>');
+    const res = await runAction(config, 'innerText', { selector: args[0] });
+    console.log(res.result.text);
+    return res;
+  },
+};
+
+COMMANDS['innerhtml'] = {
+  usage: 'innerhtml <selector>',
+  desc:  'Print inner HTML of an element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig innerhtml <selector>');
+    const res = await runAction(config, 'innerHTML', { selector: args[0] });
+    console.log(res.result.html);
+    return res;
+  },
+};
+
+COMMANDS['attr'] = {
+  usage: 'attr <selector> <attribute>',
+  desc:  'Print an attribute value of an element',
+  async run(config, args) {
+    if (!args[0] || !args[1]) throw new Error('Usage: playbig attr <selector> <attribute>');
+    const res = await runAction(config, 'getAttribute', { selector: args[0], attribute: args[1] });
+    console.log(res.result.value);
+    return res;
+  },
+};
+
+COMMANDS['input-value'] = {
+  usage: 'input-value <selector>',
+  desc:  'Print the current value of an input/textarea/select element',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig input-value <selector>');
+    const res = await runAction(config, 'inputValue', { selector: args[0] });
+    console.log(res.result.value);
+    return res;
+  },
+};
+
+COMMANDS['is-visible'] = {
+  usage: 'is-visible <selector>',
+  desc:  'Print true/false — whether the element is visible',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig is-visible <selector>');
+    const res = await runAction(config, 'isVisible', { selector: args[0] });
+    console.log(res.result.visible);
+    return res;
+  },
+};
+
+COMMANDS['is-enabled'] = {
+  usage: 'is-enabled <selector>',
+  desc:  'Print true/false — whether the element is enabled',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig is-enabled <selector>');
+    const res = await runAction(config, 'isEnabled', { selector: args[0] });
+    console.log(res.result.enabled);
+    return res;
+  },
+};
+
+COMMANDS['is-checked'] = {
+  usage: 'is-checked <selector>',
+  desc:  'Print true/false — whether the checkbox is checked',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig is-checked <selector>');
+    const res = await runAction(config, 'isChecked', { selector: args[0] });
+    console.log(res.result.checked);
+    return res;
+  },
+};
+
+COMMANDS['count'] = {
+  usage: 'count <selector>',
+  desc:  'Print the number of elements matching a selector',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig count <selector>');
+    const res = await runAction(config, 'count', { selector: args[0] });
+    console.log(res.result.count);
+    return res;
+  },
+};
+
+// Waiting
+COMMANDS['wait'] = {
+  usage: 'wait <selector> [state]',
+  desc:  'Wait for selector to reach state: visible (default), hidden, attached, detached',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig wait <selector> [state]');
+    const params = { selector: args[0] };
+    if (args[1]) params.state = args[1];
+    await runAction(config, 'waitForSelector', params);
+    console.log(`Found: ${args[0]}`);
+  },
+};
+
+COMMANDS['wait-nav'] = {
+  usage: 'wait-nav [timeout-ms]',
+  desc:  'Wait for the next navigation to complete',
+  async run(config, args) {
+    const params = {};
+    if (args[0]) params.timeout = parseInt(args[0], 10);
+    const res = await runAction(config, 'waitForNavigation', params);
+    console.log(`Navigation complete: ${res.result.url}`);
+    return res;
+  },
+};
+
+COMMANDS['wait-load'] = {
+  usage: 'wait-load [state]',
+  desc:  'Wait for load state: load (default), domcontentloaded, networkidle',
+  async run(config, args) {
+    const params = {};
+    if (args[0]) params.state = args[0];
+    await runAction(config, 'waitForLoadState', params);
+    console.log(`Load state reached: ${args[0] || 'load'}`);
+  },
+};
+
+COMMANDS['sleep'] = {
+  usage: 'sleep <ms>',
+  desc:  'Wait for N milliseconds in the browser (max 60000)',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig sleep <ms>');
+    const ms = parseInt(args[0], 10);
+    await runAction(config, 'waitForTimeout', { ms });
+    console.log(`Slept ${ms}ms`);
+  },
+};
+
+// Viewport & scroll
+COMMANDS['scroll'] = {
+  usage: 'scroll [x] [y]',
+  desc:  'Scroll to absolute position in pixels (default: 0 0)',
+  async run(config, args) {
+    const x = parseInt(args[0] || '0', 10);
+    const y = parseInt(args[1] || '0', 10);
+    await runAction(config, 'scroll', { x, y });
+    console.log(`Scrolled to (${x}, ${y})`);
+  },
+};
+
+COMMANDS['viewport'] = {
+  usage: 'viewport <width> <height>',
+  desc:  'Set the browser viewport size',
+  async run(config, args) {
+    if (!args[0] || !args[1]) throw new Error('Usage: playbig viewport <width> <height>');
+    const width  = parseInt(args[0], 10);
+    const height = parseInt(args[1], 10);
+    await runAction(config, 'setViewport', { width, height });
+    console.log(`Viewport: ${width}x${height}`);
+  },
+};
+
+// Capture
+COMMANDS['screenshot'] = {
+  usage: 'screenshot [--full] [file.png]',
+  desc:  'Take a screenshot; saves to ./screenshot.png or the given path',
+  async run(config, args) {
+    const fullPage = args.includes('--full');
+    const fileArg  = args.find(a => !a.startsWith('-'));
+    const outFile  = fileArg || 'screenshot.png';
+
+    const res = await runAction(config, 'screenshot', { fullPage, type: 'png' });
+    const buf = Buffer.from(res.result.image, 'base64');
+    fs.writeFileSync(outFile, buf);
+    console.log(`Screenshot saved: ${outFile} (${buf.length} bytes)`);
+    return res;
+  },
+};
+
+COMMANDS['pdf'] = {
+  usage: 'pdf [file.pdf]',
+  desc:  'Export the page as a PDF; saves to ./page.pdf or the given path',
+  async run(config, args) {
+    const outFile = args[0] || 'page.pdf';
+    const res     = await runAction(config, 'pdf');
+    const buf     = Buffer.from(res.result.pdf, 'base64');
+    fs.writeFileSync(outFile, buf);
+    console.log(`PDF saved: ${outFile} (${buf.length} bytes)`);
+    return res;
+  },
+};
+
+// JavaScript execution
+COMMANDS['eval'] = {
+  usage: 'eval <code>',
+  desc:  'Evaluate a JS expression in the browser (page.evaluate)',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig eval <js-expression>');
+    const res = await runAction(config, 'evaluate', { code: args[0] });
+    print(res.result.result);
+    return res;
+  },
+};
+
+COMMANDS['exec'] = {
+  usage: 'exec <code>',
+  desc:  'Execute Playwright code on the server (page/context/browser in scope)',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig exec <code>');
+    const res = await runAction(config, 'exec', { code: args[0] });
+    print(res.result.result);
+    return res;
+  },
+};
+
+// Cookies
+COMMANDS['cookies'] = {
+  usage: 'cookies',
+  desc:  'List all cookies for the current session',
+  async run(config) {
+    const res = await runAction(config, 'cookies');
+    print(res.result.cookies);
+    return res;
+  },
+};
+
+COMMANDS['set-cookies'] = {
+  usage: 'set-cookies <json-array>',
+  desc:  'Set cookies from a JSON array of cookie objects',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig set-cookies \'[{"name":"x","value":"y","domain":"..."}]\'');
+    let cookies;
+    try { cookies = JSON.parse(args[0]); } catch { throw new Error('Invalid JSON — expected a cookie array'); }
+    if (!Array.isArray(cookies)) throw new Error('Expected a JSON array of cookies');
+    await runAction(config, 'setCookies', { cookies });
+    console.log(`Set ${cookies.length} cookie(s)`);
+  },
+};
+
+COMMANDS['clear-cookies'] = {
+  usage: 'clear-cookies',
+  desc:  'Clear all cookies for the current session',
+  async run(config) {
+    await runAction(config, 'clearCookies');
+    console.log('Cookies cleared');
+  },
+};
+
+// Logs
+COMMANDS['logs'] = {
+  usage: 'logs [--since <epoch-ms>] [--type <type>]',
+  desc:  'Print console logs and page errors (type: log|warn|error|info|debug)',
+  async run(config, args) {
+    const id    = resolveSession(config);
+    const query = {};
+    const si    = args.indexOf('--since');
+    const ti    = args.indexOf('--type');
+    if (si >= 0 && args[si + 1]) query.since = args[si + 1];
+    if (ti >= 0 && args[ti + 1]) query.type  = args[ti + 1];
+
+    const data = await apiRequest(config, 'GET', `/sessions/${id}/logs`, undefined, query);
+
+    for (const log of data.logs) {
+      const ts = new Date(log.timestamp).toISOString();
+      console.log(`[${ts}] [${log.type.padEnd(5)}] ${log.text}`);
+    }
+    for (const err of data.pageErrors) {
+      const ts = new Date(err.timestamp).toISOString();
+      console.log(`[${ts}] [error] ${err.message}`);
+    }
+    if (!data.logs.length && !data.pageErrors.length) console.log('No logs.');
+    return data;
+  },
+};
+
+COMMANDS['clear-logs'] = {
+  usage: 'clear-logs',
+  desc:  'Clear the console log buffer for the current session',
+  async run(config) {
+    const id = resolveSession(config);
+    await apiRequest(config, 'DELETE', `/sessions/${id}/logs`);
+    console.log('Logs cleared');
+  },
+};
+
+// Network
+COMMANDS['network'] = {
+  usage: 'network [--since <epoch-ms>] [--url <substring>]',
+  desc:  'Print network requests and responses',
+  async run(config, args) {
+    const id    = resolveSession(config);
+    const query = {};
+    const si    = args.indexOf('--since');
+    const ui    = args.indexOf('--url');
+    if (si >= 0 && args[si + 1]) query.since = args[si + 1];
+    if (ui >= 0 && args[ui + 1]) query.url   = args[ui + 1];
+
+    const data = await apiRequest(config, 'GET', `/sessions/${id}/network`, undefined, query);
+
+    for (const req of data.requests) {
+      console.log(`→ ${req.method.padEnd(6)} ${req.url}`);
+    }
+    for (const res of data.responses) {
+      console.log(`← ${String(res.status).padEnd(6)} ${res.url}`);
+    }
+    if (!data.requests.length && !data.responses.length) console.log('No network traffic.');
+    return data;
+  },
+};
+
+COMMANDS['clear-network'] = {
+  usage: 'clear-network',
+  desc:  'Clear the network buffer for the current session',
+  async run(config) {
+    const id = resolveSession(config);
+    await apiRequest(config, 'DELETE', `/sessions/${id}/network`);
+    console.log('Network buffer cleared');
+  },
+};
+
+// Multi-session: switch active session
+COMMANDS['use'] = {
+  usage: 'use <session-id>',
+  desc:  'Switch the active session (updates ~/.playbig-session)',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig use <session-id>');
+    // Verify session exists before switching
+    await apiRequest(config, 'GET', `/sessions/${args[0]}`);
+    writeSession(args[0]);
+    console.log(`Active session: ${args[0]}`);
+  },
+};
+
+// Accessibility tree snapshot
+COMMANDS['snapshot'] = {
+  usage: 'snapshot [selector]',
+  desc:  'Print the accessibility tree (optionally rooted at a selector)',
+  async run(config, args) {
+    const params = {};
+    if (args[0]) params.root = args[0];
+    const res = await runAction(config, 'snapshot', params);
+    print(res.result.snapshot);
+    return res;
+  },
+};
+
+// Resize (alias for viewport — kept for parity with other browser automation tools)
+COMMANDS['resize'] = {
+  usage: 'resize <width> <height>',
+  desc:  'Resize the browser viewport (alias for: viewport)',
+  async run(config, args) {
+    if (!args[0] || !args[1]) throw new Error('Usage: playbig resize <width> <height>');
+    await runAction(config, 'resize', { width: parseInt(args[0], 10), height: parseInt(args[1], 10) });
+    console.log(`Viewport: ${args[0]}x${args[1]}`);
+  },
+};
+
+// Dialog handling
+COMMANDS['handle-dialog'] = {
+  usage: 'handle-dialog [accept|dismiss] [prompt-text]',
+  desc:  'Arm a one-shot handler for the NEXT dialog (alert/confirm/prompt). Call BEFORE the action that triggers it.',
+  async run(config, args) {
+    const response   = args[0] || 'accept';
+    const promptText = args[1] != null ? args[1] : null;
+    if (response !== 'accept' && response !== 'dismiss') {
+      throw new Error('Usage: playbig handle-dialog [accept|dismiss] [prompt-text]');
+    }
+    const params = { response };
+    if (promptText != null) params.promptText = promptText;
+    await runAction(config, 'handleDialog', params);
+    console.log(`Dialog handler armed: ${response}${promptText != null ? ` (text: "${promptText}")` : ''}`);
+  },
+};
+
+COMMANDS['dialogs'] = {
+  usage: 'dialogs',
+  desc:  'List dialog history for the current session (last 20)',
+  async run(config) {
+    const res = await runAction(config, 'dialogs');
+    const list = res.result.dialogs;
+    if (!list.length) {
+      console.log('No dialogs recorded.');
+    } else {
+      for (const d of list) {
+        const ts = new Date(d.timestamp).toISOString();
+        console.log(`[${ts}] [${d.type}] ${d.message}${d.defaultValue ? ` (default: ${d.defaultValue})` : ''}`);
+      }
+    }
+    return res;
+  },
+};
+
+// File upload
+COMMANDS['upload-file'] = {
+  usage: 'upload-file <selector> <filepath>',
+  desc:  'Upload a local file to a <input type="file"> element',
+  async run(config, args) {
+    if (!args[0] || !args[1]) throw new Error('Usage: playbig upload-file <selector> <filepath>');
+    const selector = args[0];
+    const filepath = args[1];
+
+    let fileContent;
+    try {
+      fileContent = fs.readFileSync(filepath);
+    } catch (err) {
+      throw new Error(`Cannot read file "${filepath}": ${err.message}`);
+    }
+
+    const name     = require('path').basename(filepath);
+    const content  = fileContent.toString('base64');
+    await runAction(config, 'uploadFile', { selector, name, content });
+    console.log(`Uploaded: ${filepath} → ${selector}`);
+  },
+};
+
+// Raw escape hatch
+COMMANDS['action'] = {
+  usage: 'action <action-name> [json-params]',
+  desc:  'Run any action directly with raw JSON params',
+  async run(config, args) {
+    if (!args[0]) throw new Error('Usage: playbig action <action-name> [json-params]');
+    let params = {};
+    if (args[1]) {
+      try { params = JSON.parse(args[1]); } catch { throw new Error('Invalid JSON for params'); }
+    }
+    const res = await runAction(config, args[0], params);
+    print(res);
+    return res;
+  },
+};
+
+// ── Help ─────────────────────────────────────────────────────────────────────
+
+function printHelp() {
+  const PAD = 48;
+  const lines = [
+    'playbig — Playwright browser session CLI',
+    '',
+    'Usage:  playbig [--session <id>] <command> [args...]',
+    '',
+    'Config: ~/.playbig  (key=value, or just a bare token)',
+    '  token=<access-token>',
+    '  url=http://localhost:3000',
+    '',
+    'Env overrides:',
+    '  PLAYBIG_TOKEN=<token>',
+    '  PLAYBIG_URL=<url>',
+    '',
+    'Session state is persisted in ~/.playbig-session',
+    '  --session <id>   Override the active session for a single command.',
+    '                   Use `playbig use <id>` to change the persistent default.',
+    '',
+    'Multi-tab / parallel work:',
+    '  Each session is an isolated browser process. For multi-tab workflows:',
+    '    playbig start-session https://tab1.example.com  # creates tab-A',
+    '    TAB_A=$(cat ~/.playbig-session)',
+    '    playbig start-session https://tab2.example.com  # creates tab-B (replaces active)',
+    '    TAB_B=$(cat ~/.playbig-session)',
+    '    playbig --session $TAB_A title',
+    '    playbig --session $TAB_B click "#btn"',
+    '',
+    'Commands:',
+  ];
+
+  const groups = [
+    { name: 'Session',          cmds: ['start-session', 'end-session', 'sessions', 'status', 'use', 'health'] },
+    { name: 'Navigation',       cmds: ['goto', 'reload', 'back', 'forward', 'url', 'title', 'content'] },
+    { name: 'Interaction',      cmds: ['click', 'dblclick', 'fill', 'type', 'press', 'hover', 'select', 'check', 'uncheck', 'focus'] },
+    { name: 'Query',            cmds: ['innertext', 'innerhtml', 'attr', 'input-value', 'is-visible', 'is-enabled', 'is-checked', 'count'] },
+    { name: 'Wait',             cmds: ['wait', 'wait-nav', 'wait-load', 'sleep'] },
+    { name: 'Viewport/Scroll',  cmds: ['scroll', 'viewport', 'resize'] },
+    { name: 'Capture',          cmds: ['screenshot', 'pdf'] },
+    { name: 'Accessibility',    cmds: ['snapshot'] },
+    { name: 'JavaScript',       cmds: ['eval', 'exec'] },
+    { name: 'Dialogs',          cmds: ['handle-dialog', 'dialogs'] },
+    { name: 'File upload',      cmds: ['upload-file'] },
+    { name: 'Cookies',          cmds: ['cookies', 'set-cookies', 'clear-cookies'] },
+    { name: 'Logs',             cmds: ['logs', 'clear-logs'] },
+    { name: 'Network',          cmds: ['network', 'clear-network'] },
+    { name: 'Advanced',         cmds: ['action'] },
+  ];
+
+  for (const g of groups) {
+    lines.push(`\n  ${g.name}:`);
+    for (const name of g.cmds) {
+      const cmd = COMMANDS[name];
+      if (cmd) {
+        const usage = `playbig ${cmd.usage}`;
+        lines.push(`    ${usage.padEnd(PAD)}${cmd.desc}`);
+      }
+    }
+  }
+
+  console.log(lines.join('\n'));
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main(argv) {
+  argv = argv || process.argv;
+  let args = argv.slice(2);
+
+  // Extract global --session <id> flag (may appear anywhere before the command)
+  let sessionOverride = null;
+  const si = args.indexOf('--session');
+  if (si >= 0 && args[si + 1] && !args[si + 1].startsWith('-')) {
+    sessionOverride = args[si + 1];
+    args = [...args.slice(0, si), ...args.slice(si + 2)];
+  }
+
+  const [cmd, ...cmdArgs] = args;
+
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    printHelp();
+    return;
+  }
+
+  const command = COMMANDS[cmd];
+  if (!command) {
+    console.error(`Unknown command: ${cmd}`);
+    console.error('Run `playbig help` for usage.');
+    process.exit(1);
+  }
+
+  const config = { ...loadConfig(), session: sessionOverride };
+  await command.run(config, cmdArgs);
+}
+
+// Export internals for testing
+module.exports = {
+  loadConfig, readSession, writeSession, apiRequest, runAction,
+  resolveSession, COMMANDS, printHelp, main,
+  CONFIG_FILE, SESSION_FILE,
+};
+
+if (require.main === module) {
+  main().catch(err => {
+    console.error(`Error: ${err.message}`);
+    if (err.status) console.error(`HTTP ${err.status}`);
+    process.exit(1);
+  });
+}

@@ -182,6 +182,125 @@ Content-Type: application/json
 { "action": "exec", "params": { "code": "const title = await page.title(); return { title };" } }
 ```
 
+#### Accessibility snapshot
+
+Returns the full accessibility tree for the current page. Useful for understanding page structure without parsing HTML, and for AI agents that prefer semantic descriptions over raw markup.
+
+| Action | Key params | Returns |
+|--------|-----------|---------|
+| `snapshot` | `root?` (CSS selector), `interestingOnly?` (bool, default `true`) | `snapshot` (nested object) |
+
+```json
+{ "action": "snapshot" }
+{ "action": "snapshot", "params": { "root": "main", "interestingOnly": false } }
+```
+
+The `root` param scopes the tree to a subtree. `interestingOnly: false` includes every DOM node; the default omits nodes with no accessible role.
+
+#### Resize
+
+Alias for `setViewport`. Both action names are equivalent.
+
+| Action | Key params |
+|--------|-----------|
+| `setViewport` / `resize` | `width`, `height` |
+
+```json
+{ "action": "resize", "params": { "width": 1280, "height": 800 } }
+```
+
+#### Dialogs
+
+Alert, confirm, and prompt dialogs block the page until handled. Install a one-shot handler **before** triggering the action that opens the dialog.
+
+| Action | Key params | Description |
+|--------|-----------|-------------|
+| `handleDialog` | `response` (`accept`/`dismiss`), `promptText?` | Arm handler for the **next** dialog |
+| `dialogs` | — | Return history of dialogs seen this session (last 20) |
+
+Without a pre-armed handler, dialogs are auto-dismissed so the page never hangs.
+
+**Typical usage:**
+```json
+// 1. Arm the handler
+{ "action": "handleDialog", "params": { "response": "accept" } }
+
+// 2. Trigger the dialog
+{ "action": "click", "params": { "selector": "#confirm-delete" } }
+
+// 3. (Optional) inspect history
+{ "action": "dialogs" }
+```
+
+For `prompt()` dialogs, use `promptText` to supply the typed value:
+```json
+{ "action": "handleDialog", "params": { "response": "accept", "promptText": "my answer" } }
+```
+
+#### File upload
+
+Sets files on a `<input type="file">` element. Two options:
+
+| Option | Params | When to use |
+|--------|--------|-------------|
+| Base64 content | `selector`, `name`, `content` (base64), `mimeType?` | File lives on the caller's side |
+| Server-side path | `selector`, `path` | File already on the playbig server |
+
+```json
+{ "action": "uploadFile", "params": {
+  "selector": "#file-input",
+  "name": "report.pdf",
+  "content": "<base64-encoded bytes>",
+  "mimeType": "application/pdf"
+}}
+```
+
+---
+
+## Multi-tab / parallel sessions
+
+playbig maps browser "tabs" to **separate sessions** — each session is its own isolated Chromium process. This differs from tools like playwright-mcp, where tabs share a single browser instance. The trade-off is stronger isolation (no cookie or storage bleed) at the cost of slightly higher memory per "tab".
+
+**Open two tabs and drive them concurrently:**
+
+```bash
+# Open tab A
+curl -s -X POST http://localhost:3000/sessions -H "Content-Type: application/json" \
+  -d '{"url":"https://site-a.example.com"}' | jq -r .id
+# → "sess-aaaa"
+
+# Open tab B
+curl -s -X POST http://localhost:3000/sessions -H "Content-Type: application/json" \
+  -d '{"url":"https://site-b.example.com"}' | jq -r .id
+# → "sess-bbbb"
+
+# Act on each independently
+curl -s -X POST http://localhost:3000/sessions/sess-aaaa/action \
+  -H "Content-Type: application/json" -d '{"action":"click","params":{"selector":"#login"}}'
+
+curl -s -X POST http://localhost:3000/sessions/sess-bbbb/action \
+  -H "Content-Type: application/json" -d '{"action":"screenshot"}'
+```
+
+**With the CLI**, use `--session` to target a specific session without changing your persistent active session:
+
+```bash
+# Capture both IDs
+TAB_A=$(playbig start-session https://site-a.example.com && cat ~/.playbig-session)
+playbig start-session https://site-b.example.com   # replaces active
+TAB_B=$(cat ~/.playbig-session)
+
+# Drive them side by side
+playbig --session "$TAB_A" click "#login"
+playbig --session "$TAB_B" screenshot tab-b.png
+
+# Switch the persistent default
+playbig use "$TAB_A"
+playbig title   # now acts on tab A
+```
+
+Sessions are fully isolated — cookies, localStorage, and network state never bleed between them.
+
 ---
 
 ## Observability
@@ -465,3 +584,76 @@ node examples/capture-network.js   # network traffic capture
 node examples/console-logs.js      # console log and page error capture
 node examples/leader-slave.js      # distributed session creation
 ```
+
+---
+
+## CLI (`./playbig`)
+
+A local command-line tool for driving the API interactively. Requires Node ≥ 18 (uses built-in `fetch`).
+
+### Setup
+
+```bash
+# Put your token in ~/.playbig
+echo "token=pbk_..." > ~/.playbig
+# Optionally set the server URL (default: http://localhost:3000)
+echo "url=http://myserver:3000" >> ~/.playbig
+```
+
+Or via env vars: `PLAYBIG_TOKEN=pbk_...` and `PLAYBIG_URL=http://...`.
+
+### Quick reference
+
+```bash
+# Session lifecycle
+playbig start-session [url]       # launch browser (kills existing session)
+playbig end-session               # close browser
+playbig sessions                  # list all sessions (* = active)
+playbig use <session-id>          # switch active session
+
+# Navigation
+playbig goto https://example.com
+playbig reload / back / forward
+playbig url / title / content
+
+# DOM
+playbig click "#submit"
+playbig fill "#email" "user@example.com"
+playbig press Enter
+playbig wait "#result"            # waits for selector (visible by default)
+
+# Capture
+playbig screenshot page.png
+playbig screenshot --full full.png
+playbig pdf page.pdf
+
+# Accessibility tree
+playbig snapshot                  # full page
+playbig snapshot main             # rooted at <main>
+
+# Resize viewport
+playbig resize 1280 800
+playbig viewport 1920 1080        # synonym
+
+# Dialogs — arm BEFORE the action that opens the dialog
+playbig handle-dialog accept
+playbig click "#delete-account"
+playbig dialogs                   # inspect history
+
+# File upload
+playbig upload-file "#avatar" ./photo.jpg
+
+# JS execution
+playbig eval "document.title"
+playbig exec "return await page.title();"
+
+# Observability
+playbig logs --type error
+playbig network --url api/
+playbig health
+
+# Multi-session targeting
+playbig --session <id> <command>  # target a session without changing ~/.playbig-session
+```
+
+Full help: `playbig help`

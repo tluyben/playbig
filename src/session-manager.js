@@ -47,6 +47,11 @@ class SessionManager {
       pageErrors:  [],
       networkRequests:  [],
       networkResponses: [],
+      // Dialog capture ring-buffer (capped at 20; rare events)
+      dialogHistory:   [],
+      // One-shot handler installed by the 'handleDialog' action.
+      // Fires on the next dialog; then auto-clears.
+      dialogResponder: null,
       createdAt:    Date.now(),
       lastActivity: Date.now(),
       status: 'initializing',
@@ -161,6 +166,28 @@ class SessionManager {
     page.on('crash', () => {
       session.status = 'crashed';
       console.error(`[session ${id}] page crashed`);
+    });
+
+    // Dialog capture + dispatch.
+    // The handleDialog action installs a one-shot responder for the NEXT dialog.
+    // Without one, dialogs are auto-dismissed so the page never hangs.
+    page.on('dialog', async dialog => {
+      if (session.dialogHistory.length >= 20) session.dialogHistory.shift();
+      const info = {
+        type:         dialog.type(),
+        message:      dialog.message(),
+        defaultValue: dialog.defaultValue(),
+        timestamp:    Date.now(),
+      };
+      session.dialogHistory.push(info);
+
+      const responder = session.dialogResponder;
+      session.dialogResponder = null;          // consume immediately
+      if (responder && responder.response === 'accept') {
+        await dialog.accept(responder.promptText != null ? String(responder.promptText) : undefined);
+      } else {
+        await dialog.dismiss();
+      }
     });
 
     this.sessions.set(id, session);
@@ -334,12 +361,80 @@ class SessionManager {
 
       // ── viewport / scroll ─────────────────────────────────────────────────
       case 'setViewport':
+      case 'resize':
         await page.setViewportSize({ width: params.width, height: params.height });
         return {};
 
       case 'scroll':
         await page.evaluate(`window.scrollTo(${Number(params.x) || 0}, ${Number(params.y) || 0})`);
         return {};
+
+      // ── accessibility snapshot ────────────────────────────────────────────
+      // Returns the full accessibility tree for the current page.
+      // Useful for understanding page structure without parsing HTML.
+      // params.root    — CSS selector to root the snapshot at (default: full page)
+      // params.interestingOnly — omit nodes with no accessible role (default: true)
+      case 'snapshot': {
+        const snapshotOpts = {};
+        if (params.root != null) snapshotOpts.root = await page.$(params.root);
+        if (params.interestingOnly != null) snapshotOpts.interestingOnly = params.interestingOnly;
+        const snapshot = await page.accessibility.snapshot(snapshotOpts);
+        return { snapshot };
+      }
+
+      // ── dialogs ───────────────────────────────────────────────────────────
+
+      // handleDialog — installs a ONE-SHOT responder for the next dialog that
+      // appears on this session.  Call this BEFORE triggering the action that
+      // would cause the dialog (e.g. clicking a "Delete" button).
+      //
+      // params.response   — 'accept' (default) or 'dismiss'
+      // params.promptText — text to type into prompt() dialogs (optional)
+      case 'handleDialog':
+        s.dialogResponder = {
+          response:   params.response   || 'accept',
+          promptText: params.promptText != null ? params.promptText : null,
+        };
+        return { queued: true };
+
+      // dialogs — returns the history of dialogs that have fired on this session
+      // (capped at the last 20 entries).
+      case 'dialogs':
+        return { dialogs: s.dialogHistory };
+
+      // ── file upload ───────────────────────────────────────────────────────
+      // Sets files on a <input type="file"> element.
+      //
+      // Option A — base64 content (no server-side file needed):
+      //   params.selector  — CSS selector for the file input
+      //   params.name      — filename to present to the page
+      //   params.content   — base64-encoded file content
+      //   params.mimeType  — MIME type (default: 'application/octet-stream')
+      //
+      // Option B — server-side path:
+      //   params.selector  — CSS selector for the file input
+      //   params.path      — absolute path on the playbig server
+      case 'uploadFile': {
+        if (!params.selector) {
+          throw Object.assign(new Error('uploadFile requires "selector"'), { statusCode: 400 });
+        }
+        if (params.content != null) {
+          const buf = Buffer.from(params.content, 'base64');
+          await page.setInputFiles(params.selector, {
+            name:     params.name     || 'upload',
+            mimeType: params.mimeType || 'application/octet-stream',
+            buffer:   buf,
+          });
+        } else if (params.path != null) {
+          await page.setInputFiles(params.selector, params.path);
+        } else {
+          throw Object.assign(
+            new Error('uploadFile requires "content" (base64) or "path" (server-side path)'),
+            { statusCode: 400 },
+          );
+        }
+        return {};
+      }
 
       // ── cookies ───────────────────────────────────────────────────────────
       case 'cookies':

@@ -52,11 +52,14 @@ router.delete('/:id', async (req, res, next) => {
 //   click, dblclick, fill, type, pressKey, hover, select, check, uncheck, focus,
 //   waitForSelector, waitForNavigation, waitForLoadState, waitForTimeout,
 //   getAttribute, innerText, innerHTML, inputValue, isVisible, isEnabled, isChecked, count,
-//   setViewport, scroll,
+//   setViewport (alias: resize), scroll,
+//   snapshot   ← accessibility tree
+//   handleDialog, dialogs,
+//   uploadFile,
 //   cookies, setCookies, clearCookies,
 //   screenshot, pdf,
-//   evaluate  ← runs in BROWSER context (page.evaluate)
-//   exec      ← runs on SERVER with (page, context, browser) available
+//   evaluate   ← runs in BROWSER context (page.evaluate)
+//   exec       ← runs on SERVER with (page, context, browser) available
 router.post('/:id/action', async (req, res, next) => {
   try {
     const { action, params } = req.body || {};
