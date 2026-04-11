@@ -292,6 +292,171 @@ docker compose up --build
 
 ---
 
+## Remote MCP server
+
+playbig exposes itself as a remote **Model Context Protocol** server so you can
+control a live Chromium browser directly from Claude Code, Codex CLI, opencode,
+or any other MCP-capable AI tool.
+
+### How it works
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /mcp` | Discovery / connectivity probe (no auth) |
+| `POST /mcp` | JSON-RPC 2.0 entry point — all MCP traffic |
+| `GET /admin/keys` | List access keys |
+| `POST /admin/keys` | Create an access key |
+| `DELETE /admin/keys/:key` | Revoke an access key |
+
+Access keys are stored in `./content.db` (SQLite). The `/admin/keys` endpoints
+require `Authorization: Bearer <ADMIN_SECRET>`; if `ADMIN_SECRET` is not set
+they return **503** so you're safe by default.
+
+The `/mcp` and `/admin/keys` endpoints are **leader-local** — they are never
+forwarded to follower nodes.
+
+### MCP tools exposed
+
+| Tool | Description |
+|------|-------------|
+| `browser_create_session` | Launch a new isolated Chromium session |
+| `browser_list_sessions` | List all active sessions |
+| `browser_get_session` | Get session status and metadata |
+| `browser_delete_session` | End a session and kill the browser |
+| `browser_run_action` | Run any Playwright action (navigate, click, fill, screenshot, evaluate, …) |
+| `browser_get_logs` | Retrieve console logs and page errors |
+| `browser_get_network` | Retrieve captured network requests and responses |
+
+### Setup
+
+**1. Set `ADMIN_SECRET` in your `.env`:**
+
+```bash
+# generate a strong secret
+openssl rand -hex 32
+```
+
+Add to `.env`:
+
+```
+ADMIN_SECRET=<the-generated-secret>
+```
+
+**2. Start the service:**
+
+```bash
+npm start
+```
+
+**3. Create an access key:**
+
+```bash
+curl -s -X POST http://localhost:3000/admin/keys \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"my-claude-code-key"}' | jq .
+# → { "id": "...", "key": "pbk_...", "label": "my-claude-code-key", "created_at": ... }
+```
+
+**4. Add to your AI tool** (replace `http://localhost:3000` with your server URL
+and `pbk_...` with the key from step 3):
+
+---
+
+#### Claude Code
+
+```bash
+claude mcp add --transport http playbig http://localhost:3000/mcp \
+  --header "Authorization: Bearer pbk_..."
+```
+
+Or edit `~/.claude.json` (global) / `.claude.json` (project) manually:
+
+```json
+{
+  "mcpServers": {
+    "playbig": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer pbk_..."
+      }
+    }
+  }
+}
+```
+
+Verify the server is reachable:
+
+```bash
+claude mcp list
+```
+
+---
+
+#### OpenAI Codex CLI
+
+Add to `~/.codex/config.json` (create if absent):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "playbig": {
+        "transport": "http",
+        "url": "http://localhost:3000/mcp",
+        "headers": {
+          "Authorization": "Bearer pbk_..."
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+#### opencode
+
+Add to your opencode config (typically `~/.config/opencode/config.json`):
+
+```json
+{
+  "mcp": {
+    "playbig": {
+      "type": "remote",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer pbk_..."
+      }
+    }
+  }
+}
+```
+
+---
+
+### Revoking a key
+
+```bash
+curl -s -X DELETE http://localhost:3000/admin/keys/pbk_... \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+```
+
+### Example usage from Claude Code
+
+Once the MCP server is configured, you can ask Claude Code to:
+
+```
+Use the playbig MCP tools to:
+1. Open a browser and navigate to https://example.com
+2. Take a screenshot
+3. Get the page title
+4. Close the session
+```
+
+---
+
 ## Examples
 
 ```bash
