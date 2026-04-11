@@ -17,10 +17,12 @@ function createServer() {
     next();
   });
 
-  // ── leader-mode round-robin for new session creation ──────────────────────
-  if (process.env.LEADER_MODE === 'true') {
-    app.use('/sessions', forwarder.middleware());
-  }
+  // ── follower routing (transparent proxy to follower nodes) ─────────────────
+  // When FOLLOWERS is set, the forwarder intercepts all /sessions requests:
+  //   - POST /sessions       → round-robin to a follower or self
+  //   - /sessions/:id/...    → routed to the node that owns the session
+  // The client only ever needs to talk to this (leader) node.
+  app.use('/sessions', forwarder.middleware());
 
   // ── routes ─────────────────────────────────────────────────────────────────
   app.use('/sessions', sessionsRouter);

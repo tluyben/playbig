@@ -6,6 +6,7 @@ const { checkChromium } = require('./chromium-check');
 const { createServer }  = require('./server');
 const { sessionManager } = require('./session-manager');
 const { monitor }        = require('./monitor');
+const { forwarder }      = require('./forwarder');
 
 async function main() {
   console.log('playbig starting…');
@@ -16,12 +17,12 @@ async function main() {
   const app  = createServer();
 
   const server = app.listen(port, () => {
-    const mode = process.env.LEADER_MODE === 'true' ? 'LEADER' : 'STANDALONE';
-    console.log(`playbig listening on port ${port}  [${mode}]`);
-    if (process.env.LEADER_MODE === 'true') {
-      const slaves = (process.env.SLAVE_URLS || '').split(',').filter(Boolean);
-      console.log(`  slaves: ${slaves.join(', ') || '(none configured)'}`);
-      console.log(`  includeSelf: ${process.env.FORWARD_INCLUDE_SELF !== 'false'}`);
+    if (forwarder.enabled) {
+      console.log(`playbig listening on port ${port}  [LEADER]`);
+      console.log(`  followers (${forwarder.followers.length}): ${forwarder.followers.join(', ')}`);
+      console.log(`  pool size (including self): ${forwarder.followers.length + 1}`);
+    } else {
+      console.log(`playbig listening on port ${port}  [STANDALONE]`);
     }
     const maxAge = parseInt(process.env.MAX_SESSION_AGE_MS || '0', 10);
     if (maxAge) console.log(`  maxSessionAge: ${maxAge}ms`);

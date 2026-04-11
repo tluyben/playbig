@@ -1,97 +1,221 @@
 'use strict';
 
-// Leader-mode round-robin forwarder.
+// Follower routing — transparent load distribution across multiple playbig nodes.
 //
-// When LEADER_MODE=true the leader maintains its own session pool AND forwards
-// new-session requests to slave nodes in round-robin order.
+// When FOLLOWERS is set, this node acts as the routing leader. The client always
+// talks to the leader; the leader silently proxies requests to the right follower.
 //
-// Pool composition:
-//   SLAVE_URLS=http://slave1:3000,http://slave2:3000   (required)
-//   FORWARD_INCLUDE_SELF=true                           (default: include leader itself)
+// Configuration:
+//   FOLLOWERS=host1:port1,host2:port2
+//   (full URLs like http://host1:3000 are also accepted)
 //
-// When the leader is included in the pool it handles sessions locally on its
-// own turn; slave turns are proxied via HTTP.
+// Behaviour:
+//   POST /sessions     → round-robin across followers + self; session ownership
+//                        is recorded in the in-memory registry
+//   /:id/*             → forwarded to whichever node owns the session
+//   GET /sessions      → local sessions only (follower aggregation optional)
+//   /health            → local only
+//
+// The leader always includes itself in the pool. All subsequent calls for a
+// session go through the leader — the client needs only the leader URL.
 
 const axios = require('axios');
 
-const SLAVE_URLS = (process.env.SLAVE_URLS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-const INCLUDE_SELF = process.env.FORWARD_INCLUDE_SELF !== 'false';
+function parseFollowers(envValue) {
+  return (envValue || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => (s.startsWith('http://') || s.startsWith('https://') ? s : `http://${s}`));
+}
 
 class Forwarder {
-  constructor() {
-    this._index  = 0;
-    // Build the pool: slaves + optionally a sentinel for self
-    this._pool   = [...SLAVE_URLS, ...(INCLUDE_SELF ? [null] : [])];
-    // null in the pool means "handle locally"
+  /**
+   * @param {object} [opts]
+   * @param {string[]} [opts.followers] - Override FOLLOWERS env var (used in tests)
+   */
+  constructor(opts = {}) {
+    this._followers = opts.followers !== undefined
+      ? opts.followers
+      : parseFollowers(process.env.FOLLOWERS);
+
+    // Pool: followers first, then null (self). Self is always in the pool.
+    this._pool  = [...this._followers, null];
+    this._index = 0;
+
+    // sessionId → follower URL string, or null (self)
+    this._registry = new Map();
   }
 
-  /** Return next target URL, or null meaning "handle locally". */
-  _next() {
-    if (!this._pool.length) return null; // no pool → always local
-    const target = this._pool[this._index % this._pool.length];
-    this._index++;
-    return target; // null = self, string = remote slave
+  /** True when at least one follower is configured. */
+  get enabled() {
+    return this._followers.length > 0;
   }
+
+  get followers() {
+    return [...this._followers];
+  }
+
+  // ─── registry ─────────────────────────────────────────────────────────────
+
+  register(sessionId, nodeUrl) {
+    this._registry.set(sessionId, nodeUrl ?? null);
+  }
+
+  unregister(sessionId) {
+    this._registry.delete(sessionId);
+  }
+
+  /** Returns the node URL for a session, null for self, undefined if unknown. */
+  lookup(sessionId) {
+    return this._registry.get(sessionId);
+  }
+
+  // ─── internal ─────────────────────────────────────────────────────────────
+
+  _nextNode() {
+    const node = this._pool[this._index % this._pool.length];
+    this._index++;
+    return node; // null = self
+  }
+
+  // ─── middleware ────────────────────────────────────────────────────────────
 
   /**
-   * Express middleware.
-   * Only intercepts POST /sessions (session creation) and distributes it.
-   * All other paths (get info, run action, etc.) stay local because sessions
-   * are pinned to the node that created them — the client uses the slave URL
-   * directly for subsequent calls.
+   * Express middleware — mount at /sessions.
+   *
+   * POST /    → round-robin; if follower wins, proxy and register; if self, let
+   *             the route handler run and intercept the response to register.
+   * /:id/...  → look up registry; proxy to follower or handle locally.
    */
   middleware() {
     return async (req, res, next) => {
-      // Only round-robin new session creation
-      if (req.method !== 'POST' || req.path !== '/') return next();
-      if (!SLAVE_URLS.length) return next(); // no slaves configured
+      if (!this.enabled) return next();
 
-      const target = this._next();
-      if (target === null) {
-        // Leader's own turn — handle locally
-        return next();
+      const path = req.path; // relative to the /sessions mount point
+
+      // ── POST / — new session creation ──────────────────────────────────────
+      if (req.method === 'POST' && path === '/') {
+        const node = this._nextNode();
+
+        if (node === null) {
+          // Self's turn — intercept response to register the new session id
+          const origJson = res.json.bind(res);
+          res.json = (body) => {
+            if (res.statusCode === 201 && body && body.id) {
+              this.register(body.id, null);
+            }
+            return origJson(body);
+          };
+          return next();
+        }
+
+        // Follower's turn — proxy and register
+        return this._proxyNewSession(node, req, res);
       }
-      return this._proxy(target, req, res);
+
+      // ── /:id and /:id/* — session-specific requests ────────────────────────
+      const idMatch = path.match(/^\/([^/]+)/);
+      if (idMatch) {
+        const sessionId = idMatch[1];
+        const node = this._registry.get(sessionId);
+
+        if (node === undefined) {
+          // Unknown session — let local handler return 404 (or find it if local)
+          return next();
+        }
+
+        if (node === null) {
+          // Owned by self
+          if (req.method === 'DELETE' && /^\/[^/]+$/.test(path)) {
+            // Unregister after deletion
+            const origJson = res.json.bind(res);
+            res.json = (body) => {
+              this.unregister(sessionId);
+              return origJson(body);
+            };
+          }
+          return next();
+        }
+
+        // Owned by a follower — proxy the whole request
+        if (req.method === 'DELETE' && /^\/[^/]+$/.test(path)) {
+          try {
+            const response = await this._proxyRequest(node, req);
+            this.unregister(sessionId);
+            res.setHeader('x-playbig-node', node);
+            return res.status(response.status).json(response.data);
+          } catch (err) {
+            return res.status(502).json({ error: 'Upstream follower error', detail: err.message });
+          }
+        }
+
+        return this._proxyAndRespond(node, req, res);
+      }
+
+      next();
     };
   }
 
-  async _proxy(slaveBase, req, res) {
+  // ─── proxy helpers ─────────────────────────────────────────────────────────
+
+  async _proxyNewSession(nodeUrl, req, res) {
     try {
-      const url      = `${slaveBase}${req.originalUrl}`;
       const response = await axios({
-        method:       req.method,
-        url,
+        method:       'POST',
+        url:          `${nodeUrl}/sessions`,
         data:         req.body,
-        headers: {
-          'content-type':    'application/json',
-          'x-forwarded-by':  'playbig-leader',
-        },
-        timeout:        60_000,
-        responseType:   'json',
-        validateStatus: () => true, // pass all status codes through
+        headers:      { 'content-type': 'application/json', 'x-forwarded-by': 'playbig-leader' },
+        timeout:      60_000,
+        responseType: 'json',
+        validateStatus: () => true,
       });
-      // Surface the slave base URL so the client can talk to it directly
-      res.setHeader('x-playbig-slave', slaveBase);
+      if (response.status === 201 && response.data && response.data.id) {
+        this.register(response.data.id, nodeUrl);
+      }
+      res.setHeader('x-playbig-node', nodeUrl);
       res.status(response.status).json(response.data);
     } catch (err) {
-      res.status(502).json({ error: 'Upstream slave error', detail: err.message });
+      res.status(502).json({ error: 'Upstream follower error', detail: err.message });
     }
   }
 
+  async _proxyRequest(nodeUrl, req) {
+    const url = `${nodeUrl}/sessions${req.path}`;
+    return axios({
+      method:       req.method,
+      url,
+      data:         ['POST', 'PUT', 'PATCH'].includes(req.method) ? req.body : undefined,
+      params:       Object.keys(req.query).length ? req.query : undefined,
+      headers:      { 'content-type': 'application/json', 'x-forwarded-by': 'playbig-leader' },
+      timeout:      60_000,
+      responseType: 'json',
+      validateStatus: () => true,
+    });
+  }
+
+  async _proxyAndRespond(nodeUrl, req, res) {
+    try {
+      const response = await this._proxyRequest(nodeUrl, req);
+      res.setHeader('x-playbig-node', nodeUrl);
+      res.status(response.status).json(response.data);
+    } catch (err) {
+      res.status(502).json({ error: 'Upstream follower error', detail: err.message });
+    }
+  }
+
+  // ─── diagnostics ───────────────────────────────────────────────────────────
+
   status() {
     return {
-      mode:         'leader',
-      slaves:        SLAVE_URLS,
-      includeSelf:   INCLUDE_SELF,
-      poolSize:      this._pool.length,
-      nextIndex:     this._index,
+      enabled:            this.enabled,
+      followers:          this._followers,
+      poolSize:           this._pool.length,
+      registeredSessions: this._registry.size,
+      nextIndex:          this._index,
     };
   }
 }
 
 const forwarder = new Forwarder();
-module.exports = { forwarder };
+module.exports = { forwarder, Forwarder };
