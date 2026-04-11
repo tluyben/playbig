@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+*.pid
+
+# Playwright browser cache (installed via script or docker, not committed)
+# ~/.cache/ms-playwright is the default location

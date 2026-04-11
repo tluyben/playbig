@@ -1,0 +1,56 @@
+# docker-compose.yml
+#
+# Three deployment topologies are shown here — uncomment the one you want.
+#
+# ── A: single standalone node (default) ──────────────────────────────────────
+services:
+  playbig:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      PORT: 3000
+      MAX_SESSION_AGE_MS: ${MAX_SESSION_AGE_MS:-0}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-10000}
+      MAX_CONSOLE_LOGS: ${MAX_CONSOLE_LOGS:-1000}
+      MAX_NETWORK_ENTRIES: ${MAX_NETWORK_ENTRIES:-1000}
+    restart: unless-stopped
+    # Chromium needs /dev/shm to be large enough (default 64 MB is too small)
+    shm_size: '1gb'
+
+
+# ── B: leader + slaves (uncomment and remove section A above) ─────────────────
+#
+# services:
+#
+#   playbig-leader:
+#     build: .
+#     ports:
+#       - "3000:3000"
+#     environment:
+#       PORT: 3000
+#       LEADER_MODE: "true"
+#       SLAVE_URLS: "http://playbig-slave1:3000,http://playbig-slave2:3000"
+#       FORWARD_INCLUDE_SELF: "true"   # leader also handles sessions itself
+#       MAX_SESSION_AGE_MS: 300000     # 5 min
+#     depends_on:
+#       - playbig-slave1
+#       - playbig-slave2
+#     restart: unless-stopped
+#     shm_size: '1gb'
+#
+#   playbig-slave1:
+#     build: .
+#     environment:
+#       PORT: 3000
+#       MAX_SESSION_AGE_MS: 300000
+#     restart: unless-stopped
+#     shm_size: '1gb'
+#
+#   playbig-slave2:
+#     build: .
+#     environment:
+#       PORT: 3000
+#       MAX_SESSION_AGE_MS: 300000
+#     restart: unless-stopped
+#     shm_size: '1gb'
