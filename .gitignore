@@ -5,3 +5,4 @@ node_modules/
 /test-mcp.db*
 # Playwright browser cache (installed via script or docker, not committed)
 # ~/.cache/ms-playwright is the default location
+/content.db*

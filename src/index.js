@@ -16,7 +16,7 @@ async function main() {
   const port = parseInt(process.env.PORT || '3000', 10);
   const app  = createServer();
 
-  const server = app.listen(port, () => {
+  const server = app.listen(port, '0.0.0.0', () => {
     if (forwarder.enabled) {
       console.log(`playbig listening on port ${port}  [LEADER]`);
       console.log(`  followers (${forwarder.followers.length}): ${forwarder.followers.join(', ')}`);
