@@ -28,12 +28,65 @@ function bwrapDisabled() {
   return process.env.CHROMIUM_BWRAP_DISABLE === '1';
 }
 
+// Move a Playwright Download into the session's downloads subdir on the
+// host fs (which is bind-mounted RW into the bwrap'd chromium). Records
+// metadata on the session; the bytes themselves are served by
+// GET /sessions/:id/downloads/:idx.
+//
+// Hard-capped at MAX_DOWNLOAD_BYTES per file and MAX_DOWNLOADS_PER_SESSION
+// total — a malicious site can't fill the herd's scratch space.
+async function captureDownload(session, downloadsDir, download) {
+  if (!downloadsDir) return; // bwrap disabled — fall back to playwright's default tmp
+  if (session.downloads.length >= MAX_DOWNLOADS_PER_SESSION) {
+    try { await download.cancel(); } catch { /* best effort */ }
+    return;
+  }
+  const idx = session.downloads.length;
+  const suggested = download.suggestedFilename() || `download-${idx}`;
+  // Sanitise — strip path separators and disallow .. — the file lives
+  // inside the per-session dir so even a path-traversal hit can't reach
+  // the host's real fs, but a clean name is friendlier to clients.
+  const safeName = suggested.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 200) || `download-${idx}`;
+  const finalPath = path.join(downloadsDir, `${idx}-${safeName}`);
+  try {
+    await download.saveAs(finalPath);
+    const st = fs.statSync(finalPath);
+    if (st.size > MAX_DOWNLOAD_BYTES) {
+      // Save succeeded but exceeded our cap; truncate by deleting.
+      try { fs.unlinkSync(finalPath); } catch { /* ignore */ }
+      session.downloads.push({
+        idx, name: safeName, url: download.url(),
+        bytes: st.size, savedAt: Date.now(),
+        truncated: true, error: `exceeded MAX_DOWNLOAD_BYTES (${MAX_DOWNLOAD_BYTES})`,
+      });
+      return;
+    }
+    session.downloads.push({
+      idx, name: safeName, url: download.url(),
+      bytes: st.size, savedAt: Date.now(),
+      path: finalPath,
+    });
+  } catch (err) {
+    session.downloads.push({
+      idx, name: safeName, url: download.url(),
+      bytes: 0, savedAt: Date.now(),
+      error: err.message,
+    });
+  }
+}
+
 const MAX_SESSION_AGE_MS      = parseInt(process.env.MAX_SESSION_AGE_MS      || '0',       10);
 const MAX_CONSOLE_LOGS        = parseInt(process.env.MAX_CONSOLE_LOGS        || '1000',    10);
 const MAX_NETWORK_ENTRIES     = parseInt(process.env.MAX_NETWORK_ENTRIES     || '1000',    10);
 // Max response body to buffer in memory per entry (default 1 MB). Bodies larger
 // than this still have their size recorded via content-length; the body field will be null.
 const MAX_RESPONSE_BODY_BYTES = parseInt(process.env.MAX_RESPONSE_BODY_BYTES || '1048576', 10);
+// Hard cap on each download. The bytes are written to the per-session
+// bwrap dir which lives on tmpfs/scratch — a runaway download from a
+// malicious site shouldn't be able to fill the disk. Total per-session
+// is bounded by MAX_DOWNLOADS_PER_SESSION × this.
+const MAX_DOWNLOAD_BYTES      = parseInt(process.env.MAX_DOWNLOAD_BYTES      || '104857600', 10); // 100 MB
+const MAX_DOWNLOADS_PER_SESSION = parseInt(process.env.MAX_DOWNLOADS_PER_SESSION || '50',     10);
 
 // Used to execute arbitrary Playwright-API code on the server side
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -63,11 +116,18 @@ class SessionManager {
 
     const realChromiumBin = chromium.executablePath();
     const useBwrap = !bwrapDisabled();
+    // Chromium's download artifacts land here (Playwright's downloadsPath).
+    // The path is BIND-MOUNTED RW into bwrap, so chromium-inside and
+    // playwright-outside see the same directory and download.saveAs() can
+    // resolve the source file across the mount-ns boundary.
+    const downloadsPath = path.join(sessionTmp, 'pw-downloads');
+    fs.mkdirSync(downloadsPath, { recursive: true, mode: 0o755 });
 
     const launchOpts = {
       headless: true,
       chromiumSandbox: !sandboxOff,
       args: sandboxOff ? ['--no-sandbox', '--disable-setuid-sandbox'] : [],
+      downloadsPath,
       ...(options.launch || {}),
     };
     if (useBwrap) {
@@ -112,7 +172,22 @@ class SessionManager {
       apiKeyId,
       // Per-session bwrap writable dir — cleaned up in endSession.
       bwrapSessionDir: useBwrap ? sessionTmp : null,
+      // Downloads captured via page.on('download'). Saved to the
+      // per-session bwrap dir (host fs side); the caller fetches them
+      // via GET /sessions/:id/downloads/:idx.
+      downloads: [],
     };
+
+    // Per-session downloads dir — separate subdir so it survives the
+    // chromium profile cleanup but still lives inside the bwrap-bound
+    // session directory (so chromium-inside-bwrap can write here).
+    const downloadsDir = sessionTmp ? path.join(sessionTmp, 'downloads') : null;
+    if (downloadsDir) {
+      try { fs.mkdirSync(downloadsDir, { recursive: true, mode: 0o755 }); } catch { /* ignore */ }
+    }
+
+    context.on('page', (p) => p.on('download', (d) => captureDownload(session, downloadsDir, d)));
+    page.on('download', (d) => captureDownload(session, downloadsDir, d));
 
     // Console log capture (ring buffer)
     page.on('console', msg => {
@@ -286,7 +361,30 @@ class SessionManager {
       pageErrors:   s.pageErrors.length,
       networkRequests:  s.networkRequests.length,
       networkResponses: s.networkResponses.length,
+      downloads:    s.downloads ? s.downloads.length : 0,
     };
+  }
+
+  // ─── downloads ─────────────────────────────────────────────────────────────
+
+  listDownloads(id) {
+    const s = this.sessions.get(id);
+    if (!s) { const e = new Error('Session not found'); e.statusCode = 404; throw e; }
+    // Strip the host fs path before returning — callers should never see it.
+    return s.downloads.map(({ path: _path, ...rest }) => rest);
+  }
+
+  getDownloadStream(id, idx) {
+    const s = this.sessions.get(id);
+    if (!s) { const e = new Error('Session not found'); e.statusCode = 404; throw e; }
+    const d = s.downloads[idx];
+    if (!d) { const e = new Error('Download not found'); e.statusCode = 404; throw e; }
+    if (!d.path) {
+      const e = new Error(d.error || 'Download has no body');
+      e.statusCode = 410; // gone — capture failed or was truncated
+      throw e;
+    }
+    return { path: d.path, name: d.name, bytes: d.bytes };
   }
 
   // ─── actions ───────────────────────────────────────────────────────────────

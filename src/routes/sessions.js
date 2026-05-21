@@ -179,4 +179,43 @@ router.delete('/:id/network', (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// ── GET /sessions/:id/downloads ────────────────────────────────────────────
+// List file downloads collected by Chromium's `download` event during
+// this session. The bytes never touch a path the caller hands us; they
+// flow exclusively through this API.
+//
+// Response: { downloads: [ { idx, name, url, bytes, savedAt,
+//                            error?, truncated? } ] }
+router.get('/:id/downloads', (req, res, next) => {
+  try {
+    const downloads = sessionManager.listDownloads(req.params.id);
+    res.json({ downloads });
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: err.message });
+    next(err);
+  }
+});
+
+// ── GET /sessions/:id/downloads/:idx ───────────────────────────────────────
+// Fetch the raw bytes of a single download. Content-Type is the
+// generic application/octet-stream — the caller is expected to
+// re-content-type via the suggested filename or sniff the bytes.
+router.get('/:id/downloads/:idx', (req, res, next) => {
+  try {
+    const idx = parseInt(req.params.idx, 10);
+    if (!Number.isFinite(idx) || idx < 0) {
+      return res.status(400).json({ error: 'idx must be a non-negative integer' });
+    }
+    const d = sessionManager.getDownloadStream(req.params.id, idx);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', String(d.bytes));
+    res.setHeader('Content-Disposition', `attachment; filename="${d.name.replace(/"/g, '')}"`);
+    require('fs').createReadStream(d.path).pipe(res);
+  } catch (err) {
+    if (err.statusCode === 404) return res.status(404).json({ error: err.message });
+    if (err.statusCode === 410) return res.status(410).json({ error: err.message });
+    next(err);
+  }
+});
+
 module.exports = router;
