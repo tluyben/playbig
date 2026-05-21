@@ -2,8 +2,26 @@
 
 const express = require('express');
 const { sessionManager } = require('../session-manager');
+const { validateKey } = require('../db');
 
 const router = express.Router();
+
+// ── Auth ────────────────────────────────────────────────────────────────────
+// When REQUIRE_SESSION_AUTH=1, every /sessions request must carry a valid
+// API key in `Authorization: Bearer <key>` (same key store the MCP route
+// uses, managed via /admin/keys). Default-off so standalone playbig
+// deployments keep working; the herd sidecar sets it to 1 so untrusted
+// bwrap'd steps can't reach /sessions by guessing the localhost port.
+function sessionAuth(req, res, next) {
+  if (process.env.REQUIRE_SESSION_AUTH !== '1') return next();
+  const auth = req.headers['authorization'] || '';
+  const key  = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (!key || !validateKey(key)) {
+    return res.status(401).json({ error: 'Unauthorized: invalid or missing access key' });
+  }
+  next();
+}
+router.use(sessionAuth);
 
 // ── POST /sessions ─────────────────────────────────────────────────────────
 // Create a new isolated browser session.
