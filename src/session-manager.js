@@ -3,6 +3,30 @@
 require('dotenv').config();
 const { chromium } = require('playwright');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
+
+// Per-session writable dirs live under here. Cleaned up in endSession.
+// Lives on tmpfs (or a regular dir if /tmp is not tmpfs); we ensure it
+// exists once at module load time. The dir is owned by whoever runs
+// playbig — Chromium under bwrap shares the same outer UID via --uid
+// 1000, so it can write here.
+const SESSION_ROOT = process.env.PLAYBIG_SESSION_ROOT || '/tmp/playbig-sessions';
+try { fs.mkdirSync(SESSION_ROOT, { recursive: true, mode: 0o755 }); } catch { /* ignore */ }
+
+// Wrapper script path — packaged alongside the source. Each launch sets
+// CHROMIUM_REAL_BIN + PLAYBIG_BWRAP_SESSION_DIR in env so the wrapper
+// knows what to bwrap and where to bind RW. The wrapper itself lives in
+// the repo (scripts/chromium-bwrap.sh) so it ships with the bind-mount
+// — no separate install step.
+const BWRAP_WRAPPER = path.resolve(__dirname, '..', 'scripts', 'chromium-bwrap.sh');
+
+// CHROMIUM_BWRAP_DISABLE=1 falls back to launching Chromium directly,
+// without the per-session bwrap envelope. Useful for debugging when
+// bwrap or the underlying namespace plumbing is broken; never in prod.
+function bwrapDisabled() {
+  return process.env.CHROMIUM_BWRAP_DISABLE === '1';
+}
 
 const MAX_SESSION_AGE_MS      = parseInt(process.env.MAX_SESSION_AGE_MS      || '0',       10);
 const MAX_CONSOLE_LOGS        = parseInt(process.env.MAX_CONSOLE_LOGS        || '1000',    10);
@@ -25,22 +49,36 @@ class SessionManager {
   async createSession({ url, options = {}, apiKeyLabel = null, apiKeyId = null } = {}) {
     const id = uuidv4();
 
-    // Chromium has its own multi-process sandbox (renderer, GPU, utility,
-    // network all jailed via seccomp + namespaces). We want it ON by
-    // default. Playwright's `chromiumSandbox: true` is the explicit knob —
-    // simply clearing `args` is not enough because Playwright still
-    // injects --no-sandbox into chrome-headless-shell by default.
+    // Defense in depth:
+    //   - bwrap-outside  (this wrapper): fs / pid / ipc / uts / cgroup
+    //                                    namespaces per session
+    //   - chromium-inside (chromiumSandbox:true): renderer seccomp BPF +
+    //                                              userns + no-new-privs
     //
-    // CHROMIUM_DISABLE_SANDBOX=1 leaves the historic behaviour available
-    // as an emergency rollback if Chromium's userns sandbox can't
-    // initialise in a given container.
+    // Each session gets a private writable dir under SESSION_ROOT that
+    // bwrap binds RW; everything else on the host fs is read-only.
     const sandboxOff = process.env.CHROMIUM_DISABLE_SANDBOX === '1';
-    const browser = await chromium.launch({
+    const sessionTmp = path.join(SESSION_ROOT, id);
+    fs.mkdirSync(sessionTmp, { recursive: true, mode: 0o755 });
+
+    const realChromiumBin = chromium.executablePath();
+    const useBwrap = !bwrapDisabled();
+
+    const launchOpts = {
       headless: true,
       chromiumSandbox: !sandboxOff,
       args: sandboxOff ? ['--no-sandbox', '--disable-setuid-sandbox'] : [],
       ...(options.launch || {}),
-    });
+    };
+    if (useBwrap) {
+      launchOpts.executablePath = BWRAP_WRAPPER;
+      launchOpts.env = {
+        ...process.env,
+        CHROMIUM_REAL_BIN:         realChromiumBin,
+        PLAYBIG_BWRAP_SESSION_DIR: sessionTmp,
+      };
+    }
+    const browser = await chromium.launch(launchOpts);
 
     const context = await browser.newContext({
       ...(options.context || {}),
@@ -72,6 +110,8 @@ class SessionManager {
       // browser time.
       apiKeyLabel,
       apiKeyId,
+      // Per-session bwrap writable dir — cleaned up in endSession.
+      bwrapSessionDir: useBwrap ? sessionTmp : null,
     };
 
     // Console log capture (ring buffer)
@@ -508,6 +548,15 @@ class SessionManager {
     const endedAt = Date.now();
     try { await s.browser.close(); } catch (err) {
       console.error(`[session ${id}] error closing browser: ${err.message}`);
+    }
+    // Reap the per-session bwrap work dir. Inside the bwrap mount-ns the
+    // dir held the browser's profile / SingletonLock / cookies; once
+    // chromium is gone we can delete it on the host fs side too.
+    if (s.bwrapSessionDir) {
+      try { fs.rmSync(s.bwrapSessionDir, { recursive: true, force: true }); }
+      catch (err) {
+        console.warn(`[session ${id}] failed to remove bwrap dir: ${err.message}`);
+      }
     }
     // Fire-and-forget usage callback. Don't block the response on a slow
     // upstream — the local close is what the caller cares about.
