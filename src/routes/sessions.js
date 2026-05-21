@@ -2,7 +2,7 @@
 
 const express = require('express');
 const { sessionManager } = require('../session-manager');
-const { validateKey } = require('../db');
+const { lookupKey, validateKey } = require('../db');
 
 const router = express.Router();
 
@@ -12,16 +12,27 @@ const router = express.Router();
 // uses, managed via /admin/keys). Default-off so standalone playbig
 // deployments keep working; the herd sidecar sets it to 1 so untrusted
 // bwrap'd steps can't reach /sessions by guessing the localhost port.
+//
+// On success the matched key row is attached to req.apiKey so downstream
+// routes (notably POST /sessions) can stamp the session with the caller's
+// label — used by the usage callback for attribution back to a user/job.
 function sessionAuth(req, res, next) {
   if (process.env.REQUIRE_SESSION_AUTH !== '1') return next();
   const auth = req.headers['authorization'] || '';
   const key  = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  if (!key || !validateKey(key)) {
+  if (!key) {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing access key' });
   }
+  const row = lookupKey(key);
+  if (!row) {
+    return res.status(401).json({ error: 'Unauthorized: invalid or missing access key' });
+  }
+  req.apiKey = row;
   next();
 }
 router.use(sessionAuth);
+// validateKey kept around for older call sites that still use it.
+void validateKey;
 
 // ── POST /sessions ─────────────────────────────────────────────────────────
 // Create a new isolated browser session.
@@ -29,7 +40,14 @@ router.use(sessionAuth);
 router.post('/', async (req, res, next) => {
   try {
     const { url, options } = req.body || {};
-    const id      = await sessionManager.createSession({ url, options });
+    // The auth middleware leaves req.apiKey populated (or undefined when
+    // REQUIRE_SESSION_AUTH is off). Forward the matched key's label to
+    // the session so the usage callback can attribute it back to a user.
+    const apiKeyLabel = req.apiKey?.label ?? null;
+    const apiKeyId    = req.apiKey?.id    ?? null;
+    const id      = await sessionManager.createSession({
+      url, options, apiKeyLabel, apiKeyId,
+    });
     const session = sessionManager.getSession(id);
     res.status(201).json(sessionManager.sessionInfo(session));
   } catch (err) { next(err); }

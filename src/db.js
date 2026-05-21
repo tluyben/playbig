@@ -43,9 +43,18 @@ function createDb(path) {
     return d.prepare('SELECT 1 FROM access_keys WHERE key = ?').get(key) != null;
   }
 
+  // Returns the {id, key, label, created_at} row for a valid key, or null
+  // for an invalid one. Used by auth middleware that wants to attach the
+  // label (e.g. a JSON-encoded attribution payload) to the request.
+  function lookupKey(key) {
+    return d.prepare(
+      'SELECT id, key, label, created_at FROM access_keys WHERE key = ?',
+    ).get(key) || null;
+  }
+
   function close() { d.close(); }
 
-  return { createKey, deleteKey, listKeys, validateKey, close };
+  return { createKey, deleteKey, listKeys, validateKey, lookupKey, close };
 }
 
 // ── Module-level singleton (production) ──────────────────────────────────────
@@ -61,5 +70,6 @@ function createKey(label)  { return _defaultDb().createKey(label); }
 function deleteKey(key)    { return _defaultDb().deleteKey(key); }
 function listKeys()        { return _defaultDb().listKeys(); }
 function validateKey(key)  { return _defaultDb().validateKey(key); }
+function lookupKey(key)    { return _defaultDb().lookupKey(key); }
 
-module.exports = { createKey, deleteKey, listKeys, validateKey, createDb };
+module.exports = { createKey, deleteKey, listKeys, validateKey, lookupKey, createDb };

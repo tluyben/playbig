@@ -37,7 +37,7 @@ class Monitor {
         // 1. Expiry
         if (mgr.isExpired(session)) {
           console.log(`[monitor] session ${id} exceeded MAX_SESSION_AGE_MS — terminating`);
-          await mgr.endSession(id).catch(() => {});
+          await mgr.endSession(id, 'expired').catch(() => {});
           continue;
         }
 
@@ -50,7 +50,7 @@ class Monitor {
         // 3. Crashed sessions get cleaned up
         if (session.status === 'crashed') {
           console.log(`[monitor] session ${id} crashed — cleaning up`);
-          await mgr.endSession(id).catch(() => {});
+          await mgr.endSession(id, 'crashed').catch(() => {});
           continue;
         }
 
@@ -67,7 +67,7 @@ class Monitor {
         // 5. Unresponsive → terminate
         if (session.status === 'unresponsive') {
           console.log(`[monitor] session ${id} unresponsive — terminating`);
-          await mgr.endSession(id).catch(() => {});
+          await mgr.endSession(id, 'unresponsive').catch(() => {});
         }
       } catch (err) {
         console.error(`[monitor] error processing session ${id}: ${err.message}`);

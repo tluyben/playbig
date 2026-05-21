@@ -22,7 +22,7 @@ class SessionManager {
 
   // ─── create ────────────────────────────────────────────────────────────────
 
-  async createSession({ url, options = {} } = {}) {
+  async createSession({ url, options = {}, apiKeyLabel = null, apiKeyId = null } = {}) {
     const id = uuidv4();
 
     const browser = await chromium.launch({
@@ -56,6 +56,11 @@ class SessionManager {
       lastActivity: Date.now(),
       status: 'initializing',
       options,
+      // Caller attribution — passed by the auth middleware. Used by the
+      // close-webhook so downstream billing knows which user/job spent
+      // browser time.
+      apiKeyLabel,
+      apiKeyId,
     };
 
     // Console log capture (ring buffer)
@@ -485,12 +490,38 @@ class SessionManager {
 
   // ─── destroy ───────────────────────────────────────────────────────────────
 
-  async endSession(id) {
+  async endSession(id, endReason = 'requested') {
     const s = this.sessions.get(id);
     if (!s) { const e = new Error('Session not found'); e.statusCode = 404; throw e; }
     this.sessions.delete(id);
+    const endedAt = Date.now();
     try { await s.browser.close(); } catch (err) {
       console.error(`[session ${id}] error closing browser: ${err.message}`);
+    }
+    // Fire-and-forget usage callback. Don't block the response on a slow
+    // upstream — the local close is what the caller cares about.
+    const callbackUrl = process.env.USAGE_CALLBACK_URL;
+    if (callbackUrl) {
+      const payload = {
+        session_id:   id,
+        api_key_id:   s.apiKeyId,
+        api_key_label: s.apiKeyLabel,
+        started_at:   s.createdAt,
+        ended_at:     endedAt,
+        duration_ms:  endedAt - s.createdAt,
+        end_reason:   endReason,
+      };
+      const headers = { 'Content-Type': 'application/json' };
+      const secret = process.env.USAGE_CALLBACK_SECRET;
+      if (secret) headers.Authorization = `Bearer ${secret}`;
+      fetch(callbackUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(5000),
+      }).catch((err) => {
+        console.warn(`[session ${id}] usage callback failed: ${err.message}`);
+      });
     }
     return { id, ended: true };
   }
