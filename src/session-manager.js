@@ -25,9 +25,20 @@ class SessionManager {
   async createSession({ url, options = {}, apiKeyLabel = null, apiKeyId = null } = {}) {
     const id = uuidv4();
 
+    // Chromium has its own multi-process sandbox (renderer, GPU, utility,
+    // network all jailed via seccomp + namespaces). We want it ON by
+    // default. Playwright's `chromiumSandbox: true` is the explicit knob —
+    // simply clearing `args` is not enough because Playwright still
+    // injects --no-sandbox into chrome-headless-shell by default.
+    //
+    // CHROMIUM_DISABLE_SANDBOX=1 leaves the historic behaviour available
+    // as an emergency rollback if Chromium's userns sandbox can't
+    // initialise in a given container.
+    const sandboxOff = process.env.CHROMIUM_DISABLE_SANDBOX === '1';
     const browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      chromiumSandbox: !sandboxOff,
+      args: sandboxOff ? ['--no-sandbox', '--disable-setuid-sandbox'] : [],
       ...(options.launch || {}),
     });
 
