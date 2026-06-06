@@ -6,6 +6,7 @@ const healthRouter   = require('./routes/health');
 const keysRouter     = require('./routes/keys');
 const mcpRouter      = require('./routes/mcp');
 const { monitor }    = require('./monitor');
+const chromeReaper   = require('./chrome-reaper');
 const { forwarder }  = require('./forwarder');
 
 function createServer() {
@@ -44,8 +45,9 @@ function createServer() {
     res.status(err.statusCode || 500).json({ error: err.message });
   });
 
-  // ── start watchdog ─────────────────────────────────────────────────────────
+  // ── start watchdog + OS-level chrome reaper ────────────────────────────────
   monitor.start();
+  chromeReaper.start();
 
   return app;
 }

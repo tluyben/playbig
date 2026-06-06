@@ -75,7 +75,10 @@ async function captureDownload(session, downloadsDir, download) {
   }
 }
 
-const MAX_SESSION_AGE_MS      = parseInt(process.env.MAX_SESSION_AGE_MS      || '0',       10);
+// Default 30 min (was 0 = never expire, which let leaked sessions live forever).
+// The monitor ends sessions past this; the OS-level chrome-reaper is the hard
+// backstop a bit beyond it. Set to 0 to disable age-expiry (NOT recommended).
+const MAX_SESSION_AGE_MS      = parseInt(process.env.MAX_SESSION_AGE_MS      || '1800000', 10);
 const MAX_CONSOLE_LOGS        = parseInt(process.env.MAX_CONSOLE_LOGS        || '1000',    10);
 const MAX_NETWORK_ENTRIES     = parseInt(process.env.MAX_NETWORK_ENTRIES     || '1000',    10);
 // Max response body to buffer in memory per entry (default 1 MB). Bodies larger
@@ -644,7 +647,15 @@ class SessionManager {
     if (!s) { const e = new Error('Session not found'); e.statusCode = 404; throw e; }
     this.sessions.delete(id);
     const endedAt = Date.now();
-    try { await s.browser.close(); } catch (err) {
+    // Bound the close so a hung browser.close() can't wedge the caller or the
+    // monitor tick. If it doesn't close in time the process is left for the
+    // OS-level chrome-reaper to SIGKILL — it can never outlive the hard cap.
+    try {
+      await Promise.race([
+        s.browser.close(),
+        new Promise((resolve) => setTimeout(resolve, 8000)),
+      ]);
+    } catch (err) {
       console.error(`[session ${id}] error closing browser: ${err.message}`);
     }
     // Reap the per-session bwrap work dir. Inside the bwrap mount-ns the
